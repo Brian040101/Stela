@@ -228,6 +228,91 @@ fn root_bridges() -> Vec<(u16, core::ops::RangeInclusive<u8>)> {
 /// functions.
 const CENSUS_LINES: usize = 256;
 
+/// `HOST PCI STATE` lines for each NVIDIA function as the firmware left it
+/// (command register, raw BARs, power state, the firmware's BAR 0
+/// resource) and for each bridge whose bus range holds one (its buses,
+/// command, memory and prefetch windows, bridge control), so a GPU that Stela
+/// later refuses can be told apart: BAR unassigned, decode off, low power or
+/// not forwarded. Reads of the census only; written once, with it.
+fn report_nvidia_state(functions: &[crate::pci_io::FunctionObservation]) {
+    let word = |header: &[u8; 64], offset: usize| {
+        u16::from_le_bytes([header[offset], header[offset + 1]])
+    };
+    let dword = |header: &[u8; 64], offset: usize| {
+        u32::from_le_bytes([
+            header[offset],
+            header[offset + 1],
+            header[offset + 2],
+            header[offset + 3],
+        ])
+    };
+    for function in functions.iter().take(CENSUS_LINES) {
+        let identity = function.identity();
+        let header = &function.header;
+        if identity.vendor != NVIDIA || header[0x0e] & 0x7f != 0 {
+            continue;
+        }
+        output::arguments(format_args!(
+            "HOST PCI STATE {} {:04x}:{:04x} command={:#06x} status={:#06x} bars={:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+            identity.address,
+            identity.vendor,
+            identity.device,
+            word(header, 0x04),
+            word(header, 0x06),
+            dword(header, 0x10),
+            dword(header, 0x14),
+            dword(header, 0x18),
+            dword(header, 0x1c),
+            dword(header, 0x20),
+            dword(header, 0x24),
+        ));
+        match function.pmcsr {
+            Some(pmcsr) => {
+                output::arguments(format_args!(" pmcsr={pmcsr:#06x} D{}\n", pmcsr & 3));
+            }
+            None => {
+                output::arguments(format_args!(" pmcsr=none\n"));
+            }
+        }
+        output::arguments(format_args!(
+            "HOST PCI STATE {} firmware BAR 0 resource: {:?}\n",
+            identity.address, function.bars[0]
+        ));
+        for bridge in functions.iter().take(CENSUS_LINES) {
+            let bridge_header = &bridge.header;
+            if bridge_header[0x0e] & 0x7f != 1
+                || bridge.address.segment != identity.address.segment
+                || !(bridge_header[0x19]..=bridge_header[0x1a]).contains(&identity.address.bus)
+            {
+                continue;
+            }
+            // A 64-bit prefetch window keeps its upper halves at 0x28 and 0x2c.
+            let prefetch = |register: usize, upper: usize| {
+                let wide = word(bridge_header, register) & 0xf == 1;
+                let high = if wide {
+                    u64::from(dword(bridge_header, upper))
+                } else {
+                    0
+                };
+                high << 32 | u64::from(word(bridge_header, register) & 0xfff0) << 16
+            };
+            let memory_base = u64::from(word(bridge_header, 0x20) & 0xfff0) << 16;
+            let memory_limit = u64::from(word(bridge_header, 0x22) & 0xfff0) << 16 | 0xfffff;
+            let prefetch_base = prefetch(0x24, 0x28);
+            let prefetch_limit = prefetch(0x26, 0x2c) | 0xfffff;
+            output::arguments(format_args!(
+                "HOST PCI STATE {} bridge buses={:02x}->{:02x}..{:02x} command={:#06x} control={:#06x} memory={memory_base:#x}..={memory_limit:#x} prefetch={prefetch_base:#x}..={prefetch_limit:#x} (a base above its limit is closed)\n",
+                bridge.address,
+                bridge_header[0x18],
+                bridge_header[0x19],
+                bridge_header[0x1a],
+                word(bridge_header, 0x04),
+                word(bridge_header, 0x3e),
+            ));
+        }
+    }
+}
+
 /// One `HOST PCI` line for each function the firmware lists, with what the
 /// drivers will do with it, written while the firmware still stores the
 /// boot log: a later report that names only a PCI address then maps to a
@@ -271,6 +356,7 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
             functions.len() - CENSUS_LINES
         ));
     }
+    report_nvidia_state(functions);
     let nvidia: Vec<u16> = functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)

@@ -998,10 +998,30 @@ fn claim(
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
+    // EXPERIMENTAL: firmware that boots from the iGPU may leave this function
+    // in D1-D3hot. Bring it to D0 before sizing, as the aqtion, bcm4377 and
+    // Intel Bluetooth probes do (Linux `pci_power_up`; bus mastering stays
+    // gated by the requester's preparation). It does nothing in D0, and it
+    // cannot power a function the platform switched off.
+    if let Err(error) = function.power_up(timer.as_ref()) {
+        output::arguments(format_args!(
+            "GPU {address} could not be brought to D0: {error:?}\n"
+        ));
+        return Err(ServiceError::Refused("the GPU could not be brought to D0"));
+    }
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if !matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
-        || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
-    {
+    let register_bar = matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE);
+    let command = function.config().read16(4);
+    // EXPERIMENTAL: memory decode that is off is turned on below, but only
+    // for a BAR 0 that is assigned: not zero, and aligned to its size.
+    let decode_off = matches!(command, Ok(value) if value & 2 == 0);
+    let assigned = matches!(function_bars[0], Some(Bar::Memory { address: start, size, .. }) if start != 0 && (start & (size - 1)) == 0);
+    if !register_bar || command.is_err() || (decode_off && !assigned) {
+        log_register_bar_refusal(address, function, &function_bars, command.as_ref().ok().copied());
+        // A failed command read stays the error it was before this log.
+        if register_bar && let Err(error) = command {
+            return Err(ServiceError::Config(error));
+        }
         return Err(ServiceError::Refused(
             "the GPU's register BAR does not decode",
         ));
@@ -1038,6 +1058,27 @@ fn claim(
                 }
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
+    }
+    // EXPERIMENTAL: the mount has accepted every BAR above. Turn on memory
+    // decode alone, before the configuration views below record the command
+    // word; bus mastering stays off. This cannot help a BAR the bridge above
+    // does not forward (BAR 0 then reads all ones and is refused below), a
+    // link that is down, or a function the platform powered off.
+    if decode_off {
+        let before = function.config().read16(4).map_err(ServiceError::Config)?;
+        function
+            .config()
+            .write16(4, before | 2)
+            .map_err(ServiceError::Config)?;
+        let after = function.config().read16(4).map_err(ServiceError::Config)?;
+        output::arguments(format_args!(
+            "GPU {address}: memory decode was off; command {before:#06x} -> {after:#06x}\n"
+        ));
+        if after & 2 == 0 {
+            return Err(ServiceError::Refused(
+                "the GPU's memory decode did not turn on",
+            ));
+        }
     }
     let config = function
         .config()
@@ -1279,6 +1320,49 @@ fn wait_for_firmware_boot(
             ))
         }
     }
+}
+
+/// What the GPU's own configuration space shows when [`claim`] refuses its
+/// register BAR: the command register (bit 1 is memory decode), the raw BAR
+/// dwords as left after sizing, the sized BARs, the power management state
+/// (D0 is 0) and the PCI Express link status. The BAR check cannot say
+/// whether BAR 0 is unassigned, undecoded or the function not in D0; these
+/// lines do. Reads only; a failed read prints `None`.
+fn log_register_bar_refusal(
+    address: stela_drivers::bus::pci::Address,
+    function: &mut Function<OwnedConfig>,
+    bars: &[Option<Bar>],
+    command: Option<u16>,
+) {
+    const POWER_MANAGEMENT: u8 = 0x01;
+    const EXPRESS: u8 = 0x10;
+    let capabilities = function.capabilities();
+    let config = function.config();
+    let capability = |wanted: u8| {
+        capabilities
+            .as_ref()
+            .ok()
+            .and_then(|list| list.iter().find(|(_, id)| *id == wanted))
+            .map(|(offset, _)| u16::from(*offset))
+    };
+    let raw = [0x10u16, 0x14, 0x18, 0x1c, 0x20, 0x24].map(|offset| config.read32(offset).ok());
+    let status = config.read16(6).ok();
+    let header_type = config.read8(0x0e).ok();
+    let pmcsr = capability(POWER_MANAGEMENT).and_then(|offset| config.read16(offset + 4).ok());
+    let link_status = capability(EXPRESS).and_then(|offset| config.read16(offset + 0x12).ok());
+    output::arguments(format_args!(
+        "GPU {address} register BAR: command={command:x?} memory_decode={:?} status={status:x?} header_type={header_type:x?} raw_bars={raw:x?}\n",
+        command.map(|value| value & 2 != 0),
+    ));
+    output::arguments(format_args!(
+        "GPU {address} register BAR: sized_bars={bars:?}\n"
+    ));
+    output::arguments(format_args!(
+        "GPU {address} register BAR: pm_capability={:x?} pmcsr={pmcsr:x?} d_state={:?} express_capability={:x?} link_status={link_status:x?}\n",
+        capability(POWER_MANAGEMENT),
+        pmcsr.map(|value| value & 3),
+        capability(EXPRESS),
+    ));
 }
 
 fn cold_refusal(

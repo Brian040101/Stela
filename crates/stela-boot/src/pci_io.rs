@@ -364,6 +364,16 @@ impl PciIo {
         })?;
         Ok(header)
     }
+    /// `out.len()` bytes of configuration space from `offset`, read by the
+    /// firmware. Nothing is written.
+    pub fn read_config(&mut self, offset: u32, out: &mut [u8]) -> Result<(), Error> {
+        // Width0=EfiPciIoWidthUint8; same call as `read_header`.
+        // SAFETY: live boot protocol and bounded writable local output; the
+        // firmware performs its own controller/configuration addressing.
+        status(unsafe {
+            (self.config_read)(self, 0, offset, out.len(), out.as_mut_ptr().cast())
+        })
+    }
     pub fn bar_regions(&mut self, index: u8) -> Result<Vec<BarRegion>, Error> {
         if index >= 6 {
             return Err(Error::BarIndex);
@@ -464,6 +474,10 @@ pub struct FunctionObservation {
     // A missing/unimplemented BAR is preserved as the firmware status;
     // it is not turned into an empty device or a guessed identity translation.
     pub bars: [Result<Vec<BarRegion>, Error>; 6],
+    /// The power management control/status register of an NVIDIA function,
+    /// for the boot log's GPU diagnostics only; `None` for any other
+    /// function, one without the capability, or a failed firmware read.
+    pub pmcsr: Option<u16>,
 }
 impl FunctionObservation {
     /// Copied firmware fields, to be revalidated under a real native owner.
@@ -481,6 +495,34 @@ fn header_identity(address: Address, header: &[u8; 64]) -> stela_drivers::bus::p
         device: word(2),
         class: [header[11], header[10], header[9]],
     }
+}
+/// PMCSR of the function whose 64-byte `header` this is, by walking its
+/// capability list through the firmware. `None` without a power management
+/// capability, on a header type the walk does not know, or when a read fails.
+fn power_control(protocol: &mut PciIo, header: &[u8; 64]) -> Option<u16> {
+    const POWER_MANAGEMENT: u8 = 0x01;
+    // Status bit 4 says there is a list; types 0 and 1 keep its head at 0x34.
+    if header[0x06] & 0x10 == 0 || header[0x0e] & 0x7f > 1 {
+        return None;
+    }
+    let mut pointer = header[0x34] & !3;
+    // A list in the 192 bytes after the header holds at most 48 entries.
+    for _ in 0..48 {
+        if pointer < 0x40 {
+            return None;
+        }
+        let mut entry = [0u8; 2];
+        protocol.read_config(u32::from(pointer), &mut entry).ok()?;
+        if entry[0] == POWER_MANAGEMENT {
+            let mut control = [0u8; 2];
+            protocol
+                .read_config(u32::from(pointer) + 4, &mut control)
+                .ok()?;
+            return Some(u16::from_le_bytes(control));
+        }
+        pointer = entry[1] & !3;
+    }
+    None
 }
 #[derive(Debug)]
 pub enum CaptureFailure {
@@ -551,10 +593,17 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         }) {
             return Err(CaptureFailure::Function(Error::Release(status)));
         }
+        let nvidia = u16::from_le_bytes([header[0], header[1]]) == 0x10de;
+        let pmcsr = if nvidia {
+            power_control(&mut protocol, &header)
+        } else {
+            None
+        };
         result.functions.push(FunctionObservation {
             address,
             header,
             bars,
+            pmcsr,
         });
     }
     Ok(result)
