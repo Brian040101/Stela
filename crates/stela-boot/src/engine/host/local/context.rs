@@ -10,13 +10,15 @@ use alloc::sync::Arc;
 use core::{
     arch::asm,
     marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use stela_contracts::refuse;
 use stela_drivers::{bus::mmio::owned::PhysicalSpan, platform::work::WorkError};
 
 const IF: u64 = 1 << 9;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+/// CR3's context: the PCID while PCIDE is set, PWT and PCD without it.
+const CONTEXT: u64 = 0xfff;
 
 /// This processor's GS base, as its record's self pointer names it. Every
 /// owner and identity here belongs to an activated processor, whose GS base
@@ -55,7 +57,11 @@ fn unavailable<T>(_: T) -> WorkError {
 /// saw, since the work queue reports only the error. Writes one boot-log
 /// line on the refusal path alone; it changes nothing else.
 fn corrupt(why: core::fmt::Arguments<'_>) -> WorkError {
-    crate::output::arguments(format_args!("NATIVE ROOT CORRUPT {why}\n"));
+    // A refusal can repeat at every guest clock read: the first few say it.
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::output::arguments(format_args!("NATIVE ROOT CORRUPT {why}\n"));
+    }
     WorkError::CorruptContext
 }
 
@@ -227,7 +233,12 @@ impl RootIdentity {
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
+        // With PCIDE set a guest view's root loads with its own context in
+        // CR3's low bits (`host::view_context`), while the pinned list holds
+        // the root pages: match the page, so a view's root still counts as
+        // the pinned root it is. Bits above the page address stay refused.
+        let page = current & ADDRESS;
+        if current & !(ADDRESS | CONTEXT) != 0 || !self.roots.roots().contains(&page) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
