@@ -120,6 +120,14 @@ impl Error {
         stela_boot_core::work_status::reason(self.cause(), &alloc::format!("{self}"))
     }
 }
+/// An [`Error::Work`] that also writes the stage that refused to the boot
+/// log, which the error alone does not say. Refusal path only.
+fn refused(stage: &'static str, error: WorkError) -> Error {
+    crate::output::arguments(format_args!(
+        "HOST WORK dispatch refused at {stage}: {error:?}\n"
+    ));
+    Error::Work(error)
+}
 struct Reservation {
     identity: Arc<RootIdentity>,
     _wire: &'static native_mmio::Wire,
@@ -726,7 +734,9 @@ impl KernelWork {
     ) -> Result<T, Error> {
         let clock = self.installed_clock.ok_or(Error::Clock)?;
         let identity = &self.reservation.identity;
-        identity.check_irq_cpu().map_err(Error::Work)?;
+        identity
+            .check_irq_cpu()
+            .map_err(|error| refused("dispatch_linux: check_irq_cpu", error))?;
         if identity.in_interrupt() {
             return Err(Error::Work(WorkError::InterruptContext));
         }
@@ -741,7 +751,7 @@ impl KernelWork {
             let _clear = ClearLinuxExecution(&self.linux_execution);
             body(self.executor.runtime())
         })?
-        .map_err(Error::Work)
+        .map_err(|error| refused("dispatch_linux: body", error))
     }
 
     /// Lend the actual dispatch segment for one synchronous Linux metadata leaf.
@@ -775,8 +785,12 @@ impl KernelWork {
         // frame, which the checks below refuse.
         let _root = unsafe { RestoreRoot::enter(self.root) };
         let identity = &self.reservation.identity;
-        identity.check_clock_root().map_err(Error::Work)?;
-        identity.check_dispatch().map_err(Error::Work)?;
+        identity
+            .check_clock_root()
+            .map_err(|error| refused("dispatch: check_clock_root", error))?;
+        identity
+            .check_dispatch()
+            .map_err(|error| refused("dispatch: check_dispatch", error))?;
         Ok(body(self.executor.runtime()))
     }
 

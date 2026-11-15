@@ -51,6 +51,13 @@ unsafe fn restore(saved: u64) {
 fn unavailable<T>(_: T) -> WorkError {
     WorkError::Unavailable
 }
+/// A corrupt-context refusal that names the check that refused and what it
+/// saw, since the work queue reports only the error. Writes one boot-log
+/// line on the refusal path alone; it changes nothing else.
+fn corrupt(why: core::fmt::Arguments<'_>) -> WorkError {
+    crate::output::arguments(format_args!("NATIVE ROOT CORRUPT {why}\n"));
+    WorkError::CorruptContext
+}
 
 /// Immutable CPU/descriptor/fixed-root identity, pinned by HostOwner.
 /// This survives only checked RAM ownership joins. It grants no RAM-absence,
@@ -82,11 +89,13 @@ impl ProcessRootScope<'_> {
         owner: &crate::paging::loader::LoaderTables,
     ) -> Result<(), WorkError> {
         self.identity.validate_process_root()?;
-        if root() != self.root
-            || !core::ptr::eq(self.identity.loader_tables, owner)
-            || !crate::engine::storage::entered_loader_root(owner)
-        {
-            return Err(WorkError::CorruptContext);
+        let moved = root() != self.root;
+        let same_owner = core::ptr::eq(self.identity.loader_tables, owner);
+        let entered = crate::engine::storage::entered_loader_root(owner);
+        if moved || !same_owner || !entered {
+            return Err(corrupt(format_args!(
+                "entered_original: moved={moved} same_owner={same_owner} entered={entered}"
+            )));
         }
         Ok(())
     }
@@ -96,7 +105,11 @@ impl ProcessRootScope<'_> {
     ) -> Result<Option<stela_boot_core::guarded_stacks::mappings::Observation>, WorkError> {
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(corrupt(format_args!(
+                "observe_original before: cr3 {:#x} want {:#x}",
+                root(),
+                self.root
+            )));
         }
         // SAFETY: same HostOwner/original loader owner, kept shared
         // aliases and IF0 scope were checked immediately above. No callbacks.
@@ -104,7 +117,11 @@ impl ProcessRootScope<'_> {
             unsafe { self.identity.loader_tables.observe_shared(address) }.map_err(unavailable)?;
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(corrupt(format_args!(
+                "observe_original after: cr3 {:#x} want {:#x}",
+                root(),
+                self.root
+            )));
         }
         Ok(result)
     }
@@ -125,7 +142,11 @@ impl RootIdentity {
         if root() != self.snapshot.cr3
             && !crate::engine::storage::entered_loader_root(self.loader_tables)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(corrupt(format_args!(
+                "validate_process_root: cr3 {:#x} is neither the host root {:#x} nor the entered loader root",
+                root(),
+                self.snapshot.cr3
+            )));
         }
         // SAFETY: fixed Host root is held by roots._lease, and the
         // entered original loader root is held by loader_tables. Both shared
@@ -150,12 +171,20 @@ impl RootIdentity {
             // Revalidate the original catalog's shared-window metadata
             // and page ownership; returned leaf data is not memory permission.
             let address = crate::layout::physical(self.loader_tables.root());
-            let observed = scope
-                .observe_original(address)?
-                .ok_or(WorkError::CorruptContext)?;
+            let observed = scope.observe_original(address)?.ok_or_else(|| {
+                corrupt(format_args!(
+                    "check_clock_root: no mapping for the loader root at {address:#x}"
+                ))
+            })?;
             if observed.physical != self.loader_tables.root() || observed.user || !observed.writable
             {
-                return Err(WorkError::CorruptContext);
+                return Err(corrupt(format_args!(
+                    "check_clock_root: loader root at {address:#x} maps {:#x} (want {:#x}) user={} writable={}",
+                    observed.physical,
+                    self.loader_tables.root(),
+                    observed.user,
+                    observed.writable
+                )));
             }
             Ok(())
         })();
@@ -177,14 +206,21 @@ impl RootIdentity {
         // SAFETY: immutable architectural observation; original owner kept.
         let observed = unsafe { interrupts::observe_descriptors() };
         if observed.gdt != self.gdt || observed.idt != self.idt || observed.task != self.task {
-            return Err(WorkError::CorruptContext);
+            return Err(corrupt(format_args!(
+                "descriptors: gdt {:#x} want {:#x}, idt {:#x} want {:#x}, task {:#x} want {:#x}",
+                observed.gdt, self.gdt, observed.idt, self.idt, observed.task, self.task
+            )));
         }
         Ok(())
     }
     pub(crate) fn check_current(&self) -> Result<(), WorkError> {
         self.affinity()?;
         if root() != self.snapshot.cr3 {
-            return Err(WorkError::CorruptContext);
+            return Err(corrupt(format_args!(
+                "check_current: cr3 {:#x} want {:#x}",
+                root(),
+                self.snapshot.cr3
+            )));
         }
         Ok(())
     }
@@ -196,7 +232,10 @@ impl RootIdentity {
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
             if !crate::engine::storage::entered_loader_root(self.loader_tables) {
-                return Err(WorkError::CorruptContext);
+                return Err(corrupt(format_args!(
+                    "check_irq_cpu: cr3 {current:#x} is not a pinned root {:x?} and not the entered loader root",
+                    self.roots.roots()
+                )));
             }
             let saved = disable();
             let result = self.validate_process_root();

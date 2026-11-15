@@ -2318,7 +2318,10 @@ pub(super) fn pump() {
             #[cfg(not(feature = "nvk"))]
             let serving = [0; 4];
             let (step_started, shot) = (host::rdtsc(), shootdowns());
-            let stepped = runtime.step()?;
+            let stepped = runtime.step().map_err(|error| {
+                output::arguments(format_args!("GPU pump: runtime step refused: {error:?}\n"));
+                error
+            })?;
             lap(PumpPart::Steps);
             if !stepped {
                 break;
