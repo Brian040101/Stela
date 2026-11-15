@@ -820,6 +820,14 @@ pub const GSP: &[Recipe] = &[
         166600,
         "f3ce25f3897c860e4cdde183ebf09b254d94a5d8191d666c12afb33cc7121107",
     ),
+    // Turing's FWSEC (version 2) builds its bootloader from this file, which
+    // nouveau asks for as `acr/bl.bin` under the chip's own name; WHENCE links
+    // tu104 and tu106 to it. Without it `fwsec-sb(v2)` fails with -ENOENT.
+    gsp(
+        "nvidia/tu102/acr/bl.bin",
+        1280,
+        "01326cc997716bebb0eab9fe1f463fffa0ee586079e4ca0e5bb096ab6fcfedab",
+    ),
     gsp(
         "nvidia/tu102/gsp/booter_load-570.144.bin",
         59272,
@@ -878,6 +886,15 @@ fn gsp_directory(chip: &str) -> Option<&'static str> {
 fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     if request.target.hardware != "nvidia" || request.target.revision != "linux-firmware" {
         return None;
+    }
+    // The Turing FWSEC bootloader: not a GSP-RM file, so it has no release.
+    if let Some((chip, "bl.bin")) = request.name.strip_prefix("nvidia/")?.split_once("/acr/") {
+        let owner = match chip {
+            "tu102" | "tu104" | "tu106" => "tu102",
+            _ => return None,
+        };
+        let member = format!("nvidia/{owner}/acr/bl.bin");
+        return GSP.iter().find(|recipe| recipe.image.member == member);
     }
     let (chip, file) = request.name.strip_prefix("nvidia/")?.split_once("/gsp/")?;
     let directory = gsp_directory(chip)?;
@@ -945,6 +962,18 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
             inventory.observe(request)?;
             found = true;
         }
+    }
+    // Turing's FWSEC takes its bootloader from `acr/bl.bin`; no other chip
+    // family asks for it, and `select_gsp` knows only Turing's.
+    let acr = format!("nvidia/{chip}/acr/bl.bin");
+    let request = Requirement {
+        name: &acr,
+        target,
+        minimum_bytes: 1,
+    };
+    if select_gsp(&Request::from(request)).is_some() {
+        inventory.observe(request)?;
+        found = true;
     }
     if found {
         Ok(())
@@ -1597,8 +1626,14 @@ mod tests {
         };
         for name in names("tu104") {
             assert!(gsp_member(&name).is_some(), "{name}");
-            assert!(name.starts_with("nvidia/tu104/gsp/"), "{name}");
+            assert!(
+                name.starts_with("nvidia/tu104/gsp/") || name == "nvidia/tu104/acr/bl.bin",
+                "{name}"
+            );
         }
+        // Turing asks for the FWSEC bootloader too; Ampere and later do not.
+        assert!(names("tu106").contains(&"nvidia/tu106/acr/bl.bin".to_owned()));
+        assert!(!names("ga104").iter().any(|name| name.contains("/acr/")));
         assert!(names("tu104").iter().any(|name| name.contains("/gsp-")));
         assert!(
             names("ad104")
@@ -1640,7 +1675,17 @@ mod tests {
         ] {
             assert_eq!(gsp_member(name), Some(member), "{name}");
         }
+        for (name, member) in [
+            ("nvidia/tu102/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu104/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu106/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+        ] {
+            assert_eq!(gsp_member(name), Some(member), "{name}");
+        }
         for name in [
+            "nvidia/tu116/acr/bl.bin",
+            "nvidia/ga104/acr/bl.bin",
+            "nvidia/tu106/acr/ucode_asb.bin",
             "nvidia/ga104/gsp/gsp-535.113.01.bin",
             "nvidia/gk104/gsp/gsp-570.144.bin",
             "nvidia/ga102/gsp/fmc-570.144.bin",
